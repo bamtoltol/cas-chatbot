@@ -16,8 +16,9 @@ load_dotenv(Path(__file__).parent / ".env")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 FALLBACK_MODELS = [m.strip() for m in os.getenv(
     "GEMINI_FALLBACK_MODELS", "gemini-3.7-flash,gemini-3.6-flash").split(",") if m.strip()]
-RETRY_WAITS = [3, 8]       # 재시도 전 대기 시간(초)
-TIMEOUT_SEC = 30           # 한 번 요청에 최대 대기 시간(초) - 넘으면 실패로 보고 다음 시도
+RETRY_WAITS = [3]          # 서버 혼잡(503/429) 시 같은 모델 재시도 전 대기 시간(초)
+TIMEOUT_SEC = 60           # 한 번 요청에 최대 대기 시간(초)
+TOTAL_BUDGET_SEC = 100     # 모든 재시도/대체 모델을 합친 최대 시간(초)
 
 _client = None
 
@@ -45,11 +46,19 @@ def _status(e):
 
 
 def generate(contents, config=None, verbose=True):
-    """generate_content 를 재시도/대체모델과 함께 호출. (응답, 실제 사용한 모델명) 반환"""
+    """generate_content 를 재시도/대체모델과 함께 호출. (응답, 실제 사용한 모델명) 반환
+    - 503/429(혼잡·제한): 잠시 쉬고 같은 모델 1번 더 → 그래도 실패면 다음 모델
+    - 504/시간초과: 같은 모델은 또 느릴 가능성이 커서 바로 다음 모델
+    - 404(모델 없음): 바로 다음 모델
+    - 전체 TOTAL_BUDGET_SEC 초를 넘기면 중단
+    """
     models = [GEMINI_MODEL] + [m for m in FALLBACK_MODELS if m != GEMINI_MODEL]
+    start = time.time()
     last_err = None
     for model in models:
         for attempt in range(len(RETRY_WAITS) + 1):
+            if time.time() - start > TOTAL_BUDGET_SEC:
+                raise RuntimeError(f"응답 시간 초과({TOTAL_BUDGET_SEC}초). 잠시 후 다시 시도하세요. 마지막 오류: {last_err}")
             try:
                 if verbose:
                     print(f"  → {model} 호출 중... (최대 {TIMEOUT_SEC}초)")
@@ -58,19 +67,19 @@ def generate(contents, config=None, verbose=True):
             except Exception as e:
                 last_err = e
                 code = _status(e)
-                if code is None and "timeout" in str(e).lower():
-                    code = 504  # 시간 초과도 서버 혼잡과 같이 처리
-                if code == 404:
+                if code is None and ("timeout" in str(e).lower() or "timed out" in str(e).lower()):
+                    code = 504
+                if code in (404, 504):
                     if verbose:
-                        print(f"  ⚠ {model}: 사용할 수 없는 모델(404) → 다음 모델로")
+                        print(f"  ⚠ {model}: {'사용할 수 없는 모델' if code == 404 else '응답 시간 초과'}({code}) → 다음 모델로")
                     break
-                if code in (429, 500, 503, 504) and attempt < len(RETRY_WAITS):
+                if code in (429, 500, 503) and attempt < len(RETRY_WAITS):
                     wait = RETRY_WAITS[attempt]
                     if verbose:
-                        print(f"  ⚠ {model}: 서버 혼잡/제한({code}) → {wait}초 후 재시도 ({attempt + 1}/{len(RETRY_WAITS)})")
+                        print(f"  ⚠ {model}: 서버 혼잡/제한({code}) → {wait}초 후 재시도")
                     time.sleep(wait)
                     continue
-                if code in (429, 500, 503, 504):
+                if code in (429, 500, 503):
                     if verbose:
                         print(f"  ⚠ {model}: 계속 실패 → 대체 모델로 전환")
                     break

@@ -24,7 +24,7 @@ INDEX_DIR = BASE / "data" / "index"
 
 load_dotenv(BASE / ".env")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "gemini-embedding-2")
-TOP_K = 4  # Gemini에게 넘겨줄 페이지 수
+TOP_K = 5  # Gemini에게 넘겨줄 페이지 수
 
 KOREA_NAMES = {"south korea", "korea", "kr", "대한민국", "한국", "republic of korea"}
 
@@ -105,6 +105,61 @@ def keyword_score(query: str, page_text: str) -> float:
     return score
 
 
+# ── 용어 사전: 현장 용어 → 매뉴얼 용어 (data/glossary.csv 에 한 줄씩 추가) ──
+GLOSSARY = BASE / "data" / "glossary.csv"
+
+
+def expand_query(query: str) -> str:
+    """'라벨폼' 처럼 매뉴얼에 없는 표현을 매뉴얼 용어로 확장 + 'm1510' 같은 메뉴코드 정리"""
+    extra = []
+    q_nospace = query.replace(" ", "").lower()
+    if GLOSSARY.exists():
+        with open(GLOSSARY, encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                if row["term"].replace(" ", "").lower() in q_nospace:
+                    extra.append(row["expand"])
+    for code in re.findall(r"(?:m|menu|메뉴)?\s*([1-9][0-9A-Z]{3})(?![0-9])", query, flags=re.I):
+        extra.append(f"메뉴코드 {code.upper()}")
+    return (query + " " + " ".join(extra)).strip()
+
+
+# ── 목차(메뉴코드 ↔ 쪽) 색인: '4.7.1 라벨 포맷 (메뉴코드 1510)....76' ──
+_toc_cache = {}
+
+
+def toc_entries(manual_id: str):
+    if manual_id not in _toc_cache:
+        pages, _ = load_index(manual_id)
+        printed_to_pdf = {p["printed_page"]: p["page"] for p in pages if p["printed_page"]}
+        entries = []
+        for p in pages:
+            if not p["is_toc"]:
+                continue
+            for m in re.finditer(r"([^\n.]{2,40}?)\s*\(메뉴코드\s*([0-9A-Z]{4})\)\s*\.{2,}\s*(\d{1,3})", p["text"]):
+                name = re.sub(r"^[\d.\s]+", "", m.group(1)).strip()
+                pdf_page = printed_to_pdf.get(int(m.group(3)))
+                if not pdf_page:
+                    continue
+                # 목차 쪽수가 1~2쪽 어긋난 경우가 있어, 주변 쪽 중 '메뉴코드 XXXX' 제목이 있는 쪽을 우선
+                code_key = f"메뉴코드{m.group(2)}"
+                near = [pdf_page + d for d in (0, -1, 1, -2, 2) if 1 <= pdf_page + d <= len(pages)]
+                real = next((n for n in near if code_key in pages[n - 1]["text"].replace(" ", "")), pdf_page)
+                entries.append({"name": name, "code": m.group(2), "page": real})
+        _toc_cache[manual_id] = entries
+    return _toc_cache[manual_id]
+
+
+def toc_boost(manual_id: str, expanded: str):
+    """질문(확장 후)에 목차 메뉴 이름이나 메뉴코드가 있으면 그 쪽에 가산점"""
+    q = expanded.replace(" ", "").lower()
+    boost = {}
+    for e in toc_entries(manual_id):
+        name = e["name"].replace(" ", "").lower()
+        if (len(name) >= 2 and name in q) or f"메뉴코드{e['code'].lower()}" in q:
+            boost[e["page"]] = boost.get(e["page"], 0) + 0.6
+    return boost
+
+
 def embed_query(query: str):
     res = get_client().models.embed_content(model=EMBED_MODEL, contents=[query])
     v = np.array(res.embeddings[0].values, dtype=np.float32)
@@ -114,6 +169,7 @@ def embed_query(query: str):
 def search(manual_id: str, query: str, top_k: int = TOP_K):
     """질문과 관련성이 높은 페이지 top_k개 반환"""
     pages, vecs = load_index(manual_id)
+    query = expand_query(query)
 
     kw = np.array([keyword_score(query, p["text"]) for p in pages])
     if kw.max() > 0:
@@ -129,6 +185,10 @@ def search(manual_id: str, query: str, top_k: int = TOP_K):
             score = kw
     else:
         score = kw
+
+    # 목차에서 메뉴 이름/코드가 맞는 쪽에 가산점
+    for page_no, b in toc_boost(manual_id, query).items():
+        score[page_no - 1] += b
 
     # 목차 페이지, 빈 페이지는 제외
     for i, p in enumerate(pages):
@@ -154,6 +214,8 @@ SYSTEM_PROMPT = """너는 CAS 상업용 전자저울 기술지원 챗봇이다.
 규칙:
 1. 반드시 [매뉴얼 발췌] 안의 내용만 근거로 답한다. 매뉴얼에 없는 메뉴코드, 수치, 절차를 지어내지 않는다.
 2. 답변은 한국어로, 사용자가 바로 따라 할 수 있게 번호 단계로 짧게 쓴다. 메뉴코드(예: MENU 1732)는 그대로 표기한다.
+   - 첫 줄은 한 문장 요약, 그다음 "1. ", "2. " 단계는 반드시 각각 새 줄(\n)에서 시작한다.
+   - 그림 표시 {{그림:ID}} 는 문장 안에 넣지 말고 반드시 단독 한 줄로 쓴다.
 3. 매뉴얼에서 해결 방법을 찾지 못하면 found=false, escalate=true 로 하고 "매뉴얼에서 확인되지 않아 기술문의 접수가 필요합니다"라고 안내한다.
 4. 매뉴얼이 'A/S 센터로 문의' 또는 수리가 필요하다고 안내하는 경우, 그 의미를 설명하고 escalate=true 로 한다.
 5. used_pages 에는 실제로 근거로 쓴 발췌의 PDF 페이지 번호만 넣는다.
@@ -205,6 +267,19 @@ def generate_answer(question: str, ctx: dict, pages: list):
     )
     parsed = res.parsed if res.parsed is not None else GeminiAnswer(**json.loads(res.text))
     return parsed, used_model
+
+
+def normalize_layout(text: str) -> str:
+    """Gemini가 한 줄로 붙여 쓴 답변을 '단계별 줄 + 그림 단독 줄' 형태로 정리"""
+    t = text.replace("\r", "")
+    t = re.sub(r"\s*(\{\{그림:\d+-\d+\}\})\s*", r"\n\1\n", t)        # 그림 표시 → 단독 줄
+    # 문장 끝(. ) 다 요) 뒤에 오는 '2.상품…' 형태만 새 단계로 줄바꿈 (메뉴 경로 '→ 1.상품'은 유지)
+    t = re.sub(r"(?<=[.!?)다요])[ \t]*(\d{1,2})\.[ \t]*(?=[가-힣A-Za-z\[(])", r"\n\1. ", t)
+    t = re.sub(r"(?m)^(\d{1,2})\.(?=\S)", r"\1. ", t)                     # 줄 맨 앞 '2.상품' → '2. 상품'
+    t = re.sub(r"(?m)^[ \t]+", "", t)
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
 
 
 STEP_MATCH_MIN = 0.35   # 단계 문장과 그림 주변 설명이 이 비율 이상 겹치면 같은 내용으로 판단
@@ -272,10 +347,12 @@ def answer(question: str, product: str, model: str = "", country: str = "",
     hits = search(manual["manual_id"], question)
     result, used_model = generate_answer(question, ctx, hits)
 
+    # 줄바꿈 정리: 그림 표시는 단독 줄로, 번호 단계(1. 2. ...)는 새 줄에서 시작
+    answer_text = normalize_layout(result.answer)
+
     # 답변에 들어간 그림 표시 중 실제로 존재하는 그림만 남김 (없는 ID는 제거)
     all_figs = {f["id"]: f for v in load_figures(manual["manual_id"]).values() for f in v}
     allowed_pages = {h["page"] for h in hits}
-    answer_text = result.answer
     figures_used = []
     for fid in FIG_MARK.findall(answer_text):
         if fid in all_figs and int(fid.split("-")[0]) in allowed_pages and fid not in figures_used:
