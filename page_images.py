@@ -6,6 +6,8 @@
 import csv
 from pathlib import Path
 
+from pdf_lock import PDF_LOCK
+
 BASE = Path(__file__).parent
 CATALOG = BASE / "data" / "manual_catalog.csv"
 OUT_DIR = BASE / "data" / "page_images"
@@ -28,13 +30,18 @@ def page_image(manual_id: str, page: int) -> Path:
 
     import pypdfium2 as pdfium
 
-    pdf = pdfium.PdfDocument(str(_pdf_path(manual_id)))
-    try:
-        if not 1 <= page <= len(pdf):
-            raise ValueError(f"페이지 범위 초과: {page} (총 {len(pdf)}페이지)")
-        img = pdf[page - 1].render(scale=SCALE).to_pil()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        img.save(out)
-    finally:
-        pdf.close()
+    with PDF_LOCK:
+        if out.exists():
+            return out
+        pdf = pdfium.PdfDocument(str(_pdf_path(manual_id)))
+        try:
+            if not 1 <= page <= len(pdf):
+                raise ValueError(f"페이지 범위 초과: {page} (총 {len(pdf)}페이지)")
+            img = pdf[page - 1].render(scale=SCALE).to_pil()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".tmp.png")
+            img.save(tmp)
+            tmp.replace(out)
+        finally:
+            pdf.close()
     return out

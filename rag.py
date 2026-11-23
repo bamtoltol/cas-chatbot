@@ -160,6 +160,38 @@ def toc_boost(manual_id: str, expanded: str):
     return boost
 
 
+# ── 질문 재작성: Gemini가 목차(메뉴 이름·코드)를 보고 사용자 표현을 매뉴얼 용어로 변환 ──
+class Rewrite(BaseModel):
+    keywords: str          # 매뉴얼에서 쓰는 용어로 바꾼 검색어
+    menu_codes: list[str]  # 관련 있어 보이는 메뉴코드 (목차에 있는 것만)
+
+
+def rewrite_query(question: str, manual_id: str) -> str:
+    """'아이피 설정', '라벨폼' 같은 현장 표현 → 매뉴얼 용어 + 메뉴코드. 실패하면 빈 문자열(검색은 원래 질문으로 계속)"""
+    from google.genai import types
+
+    menus = "\n".join(f"- {e['code']} {e['name']}" for e in toc_entries(manual_id))
+    prompt = f"""다음은 전자저울 사용자매뉴얼의 메뉴 목록(메뉴코드 이름)이다.
+{menus}
+
+사용자 질문: {question}
+
+사용자는 매뉴얼과 다른 표현(줄임말, 구어체, 영어 발음 한글 표기 등)을 쓸 수 있다.
+질문의 뜻을 매뉴얼에서 쓰는 용어로 바꾼 검색어(keywords)와, 위 목록 중 관련 있어 보이는 메뉴코드(menu_codes, 최대 3개)를 골라라.
+관련 메뉴가 없으면 menu_codes 는 빈 배열로 둔다. 목록에 없는 코드는 만들지 않는다."""
+    try:
+        res, _ = generate(prompt, types.GenerateContentConfig(
+            temperature=0, response_mime_type="application/json", response_schema=Rewrite),
+            verbose=False, budget=20, models=[os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")])
+        r = res.parsed or Rewrite(**json.loads(res.text))
+        valid = {e["code"] for e in toc_entries(manual_id)}
+        codes = [c for c in r.menu_codes if c in valid][:3]
+        return (r.keywords + " " + " ".join(f"메뉴코드 {c}" for c in codes)).strip()
+    except Exception as e:
+        print(f"  ⚠ 질문 재작성 생략: {e}")
+        return ""
+
+
 def embed_query(query: str):
     res = get_client().models.embed_content(model=EMBED_MODEL, contents=[query])
     v = np.array(res.embeddings[0].values, dtype=np.float32)
@@ -344,7 +376,8 @@ def answer(question: str, product: str, model: str = "", country: str = "",
 
     ctx["manual_name"] = manual["manual_name"]
     ctx["manual_id"] = manual["manual_id"]
-    hits = search(manual["manual_id"], question)
+    rewritten = rewrite_query(question, manual["manual_id"])
+    hits = search(manual["manual_id"], (question + " " + rewritten).strip())
     result, used_model = generate_answer(question, ctx, hits)
 
     # 줄바꿈 정리: 그림 표시는 단독 줄로, 번호 단계(1. 2. ...)는 새 줄에서 시작
@@ -385,5 +418,6 @@ def answer(question: str, product: str, model: str = "", country: str = "",
         "sources": sources,
         "retrieved_pages": [h["page"] for h in hits],
         "model_used": used_model,
+        "search_query": rewritten,
         "elapsed_ms": int((time.time() - t0) * 1000),
     }

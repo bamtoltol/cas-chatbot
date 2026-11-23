@@ -45,20 +45,21 @@ def _status(e):
     return getattr(e, "code", None) or getattr(e, "status_code", None)
 
 
-def generate(contents, config=None, verbose=True):
+def generate(contents, config=None, verbose=True, budget=None, models=None):
     """generate_content 를 재시도/대체모델과 함께 호출. (응답, 실제 사용한 모델명) 반환
     - 503/429(혼잡·제한): 잠시 쉬고 같은 모델 1번 더 → 그래도 실패면 다음 모델
     - 504/시간초과: 같은 모델은 또 느릴 가능성이 커서 바로 다음 모델
     - 404(모델 없음): 바로 다음 모델
     - 전체 TOTAL_BUDGET_SEC 초를 넘기면 중단
     """
-    models = [GEMINI_MODEL] + [m for m in FALLBACK_MODELS if m != GEMINI_MODEL]
+    models = models or ([GEMINI_MODEL] + [m for m in FALLBACK_MODELS if m != GEMINI_MODEL])
+    budget = budget or TOTAL_BUDGET_SEC
     start = time.time()
     last_err = None
     for model in models:
         for attempt in range(len(RETRY_WAITS) + 1):
-            if time.time() - start > TOTAL_BUDGET_SEC:
-                raise RuntimeError(f"응답 시간 초과({TOTAL_BUDGET_SEC}초). 잠시 후 다시 시도하세요. 마지막 오류: {last_err}")
+            if time.time() - start > budget:
+                raise RuntimeError(f"응답 시간 초과({budget}초). 잠시 후 다시 시도하세요. 마지막 오류: {last_err}")
             try:
                 if verbose:
                     print(f"  → {model} 호출 중... (최대 {TIMEOUT_SEC}초)")

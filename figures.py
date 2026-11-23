@@ -14,6 +14,8 @@ import csv
 import json
 from pathlib import Path
 
+from pdf_lock import PDF_LOCK
+
 BASE = Path(__file__).parent
 CATALOG = BASE / "data" / "manual_catalog.csv"
 INDEX_DIR = BASE / "data" / "index"
@@ -122,6 +124,11 @@ def build_figures(manual_id):
     """매뉴얼 전체 페이지의 그림 목록 생성 → data/index/<id>_figures.json"""
     import pypdfium2 as pdfium
 
+    with PDF_LOCK:
+        return _build_figures_locked(manual_id, pdfium)
+
+
+def _build_figures_locked(manual_id, pdfium):
     pdf = pdfium.PdfDocument(str(_pdf_path(manual_id)))
     result = {}
     try:
@@ -167,8 +174,19 @@ def figure_image(manual_id, fig_id):
 
     import pypdfium2 as pdfium
 
-    pdf = pdfium.PdfDocument(str(_pdf_path(manual_id)))
-    try:
+    with PDF_LOCK:
+        if out.exists():          # 기다리는 동안 다른 요청이 이미 만들었으면 재사용
+            return out
+        pdf = pdfium.PdfDocument(str(_pdf_path(manual_id)))
+        try:
+            _crop_save(pdf, page_no, fig, out)
+        finally:
+            pdf.close()
+    return out
+
+
+def _crop_save(pdf, page_no, fig, out):
+    if True:
         page = pdf[page_no - 1]
         W, H = page.get_size()
         img = page.render(scale=SCALE).to_pil()
@@ -177,7 +195,6 @@ def figure_image(manual_id, fig_id):
         box = (max(0, (l - pad) * SCALE), max(0, (H - t - pad) * SCALE),
                min(W * SCALE, (r + pad) * SCALE), min(H * SCALE, (H - b + pad) * SCALE))
         out.parent.mkdir(parents=True, exist_ok=True)
-        img.crop(tuple(int(v) for v in box)).save(out)
-    finally:
-        pdf.close()
-    return out
+        tmp = out.with_suffix(".tmp.png")
+        img.crop(tuple(int(v) for v in box)).save(tmp)
+        tmp.replace(out)          # 다 저장된 뒤에 이름 변경 → 반쯤 저장된 파일이 보이지 않게
