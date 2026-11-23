@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+reference/
+data/page_images/
+data/figure_images/
+preview.html

@@ -1,0 +1,9 @@
+google-genai
+python-dotenv
+pypdf
+numpy
+fastapi
+uvicorn
+pypdfium2
+fonttools
+pillow
